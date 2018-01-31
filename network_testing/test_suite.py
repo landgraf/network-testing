@@ -7,6 +7,8 @@ import os
 import re
 import socket
 import subprocess
+from networks import Network
+
 
 from .logger import logger
 
@@ -241,8 +243,6 @@ class Scenario(object):
         os.environ['DEFAULT_SERVICE'] = 'http'
 
     def delns_if_exists(self, ns):
-        if os.path.exists("/var/run/netns/%s" %(ns)):
-            subprocess.call(['ip', 'netns', 'delete', ns])
         if ns in self.namespaces:
             self.namespaces.remove(ns)
 
@@ -256,17 +256,14 @@ class Scenario(object):
     def _add_netns(self, ns):
         self.delns_if_exists(ns)
         self.namespaces.append(ns)
-        subprocess.check_call(['ip', 'netns', 'add', ns])
-        subprocess.check_call(['ip', '-n', ns, 'link', 'set', 'lo', 'up'])
+
 
     def _add_veth(self, ns1, ns2):
-        link1, link2 = ns1, ns2
-        subprocess.check_call(['ip', 'link', 'add', 'dev', link1, 'type', 'veth', 'peer', 'name', link2])
-        for ns, link in (ns1, link1), (ns2, link2):
-            subprocess.check_call(['ip', 'link', 'set', link, 'netns', ns, 'up'])
+        exit(1)
 
-    def _add_address(self, ns, link, address):
-        subprocess.check_call(['ip', '-n', ns, 'address', 'add', address, 'dev', link])
+    def _add_address(self, srcns, dstns, address):
+        srcns.add_address(dstns, address)
+        # subprocess.check_call(['ip', '-n', ns, 'address', 'add', address, 'dev', link])
 
     def error(self, error):
         self.errors.append(error)
@@ -305,12 +302,12 @@ class Scenario(object):
 
 class LoopbackScenario(Scenario):
     name = 'loopback'
+    ns = Network("test-loopback")
     description = "Isolated host with IPv4 and IPv6 loopback."
 
     def prepare(self):
         super(self.__class__, self).prepare()
         os.environ['SOURCE'] = os.environ['DESTINATION'] = 'localhost'
-        self._add_netns('test-loopback')
 
     def command(self, name, origin):
         return ['ip', 'netns', 'exec', 'test-loopback', 'wrapresolve', os.path.join(testcase_path, name, origin)]
@@ -320,11 +317,10 @@ class DualstackScenario(Scenario):
     name = 'dualstack'
     description = "Hosts connected via IPv4 and IPv6."
 
-    source_ns = 'test-client'
-    destination_ns = 'test-server'
-    source_link, destination_link = source_ns, destination_ns
+    source_ns = Network('client')
+    destination_ns = Network('server')
     destination_config = ['192.0.2.1/24', '2001:DB8::2:1/64']
-    source_config = ['192.0.2.2/24', '2001:DB8::2:2/64']
+    source_config = ['192.0.2.2/24','10.0.0.1/24', '2001:DB8::2:2/64']
 
     def prepare(self):
         super(DualstackScenario, self).prepare()
@@ -332,14 +328,16 @@ class DualstackScenario(Scenario):
         os.environ['DESTINATION'] = 'server.example.net'
         for ns in self.source_ns, self.destination_ns:
             self._add_netns(ns)
-        self._add_veth(self.source_ns, self.destination_ns)
+
+        ##self._add_veth(self.source_ns, self.destination_ns)
+        self.source_ns.connect(self.destination_ns)
         for address in self.source_config:
-            self._add_address(self.source_ns, self.source_link, address)
+            self._add_address(self.source_ns, self.destination_ns, address)
         for address in self.destination_config:
-            self._add_address(self.destination_ns, self.destination_link, address)
+            self._add_address(self.destination_ns, self.source_ns, address)
 
     def command(self, name, origin):
-        return ['ip', 'netns', 'exec', 'test-{}'.format(origin), 'wrapresolve',
+        return ['ip', 'netns', 'exec', '{}'.format(origin), 'wrapresolve',
                 os.path.join(testcase_path, name, origin)]
 
     def postprocess(self):
@@ -392,8 +390,7 @@ class IP6RejectedScenario(DualstackScenario):
         #
         # https://bugzilla.redhat.com/show_bug.cgi?id=1336496
         #
-        #subprocess.check_call(['ip', 'netns', 'exec', 'test-client', 'ip6tables', '-A', 'OUTPUT', '-j', 'REJECT'])
-        subprocess.check_call(['ip', 'netns', 'exec', 'test-client', 'ip6tables', '-A', 'OUTPUT', '-j', 'REJECT'])
+        subprocess.check_call(['ip', 'netns', 'exec', 'client', 'ip6tables', '-A', 'OUTPUT', '-j', 'REJECT'])
 
     def postprocess(self):
         v4 = [conn for conn in self.connections if conn.domain.value == socket.AF_INET]
@@ -414,7 +411,7 @@ class IP6DroppedScenario(DualstackScenario):
 
     def prepare(self):
         super(IP6DroppedScenario, self).prepare()
-        subprocess.check_call(['ip', 'netns', 'exec', 'test-client', 'ip6tables', '-A', 'OUTPUT', '-j', 'DROP'])
+        subprocess.check_call(['ip', 'netns', 'exec', 'client', 'ip6tables', '-A', 'OUTPUT', '-j', 'DROP'])
 
     def postprocess(self):
         v4 = [conn for conn in self.connections if conn.domain.value == socket.AF_INET]
@@ -466,7 +463,7 @@ class TestCase:
         return result
 
     def save(self, outdir):
-        with open(os.path.join(outdir, "test-client-server-{}.json".format(self.name)), 'w') as stream:
+        with open(os.path.join(outdir, "client-server-{}.json".format(self.name)), 'w') as stream:
             json.dump({self.name: self.to_dict()}, stream,
                       indent=4, separators=(',', ': '), sort_keys=True)
             print(file=stream)
